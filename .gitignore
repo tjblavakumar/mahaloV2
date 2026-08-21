@@ -12,10 +12,7 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Local databases and logs
-*.db
-*.sqlite
-*.sqlite3
+# Local logs
 logs/*
 !logs/.gitkeep
 
