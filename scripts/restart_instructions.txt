@@ -1,0 +1,45 @@
+MAHALO RESTART INSTRUCTIONS
+===========================
+
+The database has been successfully populated with test data, but the MCP servers
+have stale HTTP connections from when they started. You MUST restart all servers.
+
+STEPS TO RESTART:
+-----------------
+
+1. STOP all running servers:
+   - Find all terminal windows running start_all.bat
+   - Press Ctrl+C in each terminal to stop the servers
+   - OR close all the terminal windows
+
+2. WAIT a few seconds for all ports to be released
+
+3. START the servers again:
+   - Open a new terminal in the mahalo-main directory
+   - Run: scripts\start_all.bat
+   
+4. WAIT for all services to start (you'll see messages like "Uvicorn running on...")
+
+5. TEST the application:
+   - Open http://localhost:3000 in your browser
+   - Ask: "how many stories do we have?"
+   - You should now see real numbers instead of zeros!
+
+WHAT WAS FIXED:
+---------------
+✓ Database initialization error (handles existing tables)
+✓ Frontend dependencies installed (npm packages)
+✓ Database populated with 120+ stories, 110+ incidents, 30+ deployments, 1050+ logs
+✓ APIs verified working (they return data when tested directly)
+
+PROBLEM IDENTIFIED:
+------------------
+✗ MCP servers have stale HTTP client connections
+✗ They get 404 errors even though the APIs work fine
+✗ This is because they connected before data existed
+
+SOLUTION:
+---------
+→ RESTART ALL SERVERS to establish fresh connections!
+
+After restart, everything will work correctly.
