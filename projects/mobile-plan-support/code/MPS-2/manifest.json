@@ -1,0 +1,11 @@
+{
+  "story_key": "MPS-2",
+  "story_title": "Promote new plan with promo during upsell",
+  "user_query": "generate python code for MPS-2",
+  "generated_at": "2026-08-22T01:06:16.655965",
+  "files": [
+    "upsell_pricing.py",
+    "test_upsell_pricing.py"
+  ],
+  "file_count": 2
+}

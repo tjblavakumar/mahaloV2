@@ -7,6 +7,8 @@ from litellm import completion as _litellm_completion
 
 from backend.config import settings
 from backend.llm_adapter import one_min_ai_completion
+from backend.utils.code_saver import CodeSaver
+from backend.project_registry import get_project, RegistrySessionLocal, init_registry_db
 from agents.jira_agent import JiraAgent
 from agents.servicenow_agent import ServiceNowAgent
 from agents.splunk_agent import SplunkAgent
@@ -20,6 +22,7 @@ class OrchestratorAgent:
     # Intents that skip the interpretation/confirmation layer
     _SKIP_CONFIRMATION_INTENTS = frozenset({
         "greeting", "review_pending_stories", "confirm_create_story",
+        "implement_code", "save_code",
     })
 
     # Keywords that indicate the user is confirming a pending action
@@ -47,6 +50,11 @@ class OrchestratorAgent:
         self.last_insights: dict[str, Any] = {}
         # Interpretation layer state
         self.pending_action: dict[str, Any] | None = None
+        # Code generation state — tracks the last generated code for save_code
+        self.last_generated_code: str | None = None
+        self.last_code_story_key: str | None = None
+        self.last_code_story_title: str | None = None
+        self.last_code_query: str | None = None
 
     # ===== INTERPRETATION LAYER HELPERS =====
 
@@ -65,6 +73,50 @@ class OrchestratorAgent:
         if normalized in self._REJECTION_KEYWORDS:
             return True
         return any(normalized.startswith(kw) for kw in self._REJECTION_KEYWORDS)
+
+    async def _handle_save_code(self, persona: str) -> str:
+        """Handle the save_code intent — write last generated code to the project's code/ folder."""
+        if not self.last_generated_code:
+            return f"{persona}, there's no generated code to save. Ask me to implement a story first (e.g., \"write python code to implement MPS-2\")."
+
+        if not self._current_project_id:
+            return f"{persona}, no project is selected. Please select a project first so I know where to save the code."
+
+        # Look up the project's folder path from the registry
+        try:
+            init_registry_db()
+            db = RegistrySessionLocal()
+            project = get_project(db, self._current_project_id)
+            db.close()
+        except Exception as e:
+            return f"{persona}, I couldn't access the project registry: {e}"
+
+        if not project:
+            return f"{persona}, I couldn't find project '{self._current_project_id}' in the registry."
+
+        folder_path = project.folder_path
+        story_key = self.last_code_story_key or "UNKNOWN"
+
+        # Save using CodeSaver
+        saver = CodeSaver(folder_path)
+        result = saver.save(
+            code_content=self.last_generated_code,
+            story_key=story_key,
+            story_title=self.last_code_story_title or "",
+            user_query=self.last_code_query or "",
+        )
+
+        if result["success"]:
+            file_list = "\n".join(f"  - `{f}`" for f in result["files"])
+            return (
+                f"{persona}, done! Saved {result['file_count']} file(s) to:\n"
+                f"📁 `{result['directory']}`\n\n"
+                f"**Files created:**\n{file_list}\n\n"
+                f"A `manifest.json` with metadata was also created in the same folder."
+            )
+        else:
+            error_text = "; ".join(result["errors"])
+            return f"{persona}, there were errors saving the code: {error_text}"
 
     def _build_interpretation_message(self, persona: str, intent: dict[str, Any], query: str) -> str:
         """Build a human-readable interpretation of what the orchestrator understands."""
@@ -85,6 +137,8 @@ class OrchestratorAgent:
             "write_test_case": "write a test case for a story",
             "incident_status": "check the current incident status",
             "update_story": "update an existing JIRA story",
+            "implement_code": "generate implementation code for a JIRA story",
+            "save_code": "save the previously generated code to your project folder",
             "general_sdlc": "answer a general question about the delivery lifecycle",
         }
 
@@ -172,6 +226,69 @@ class OrchestratorAgent:
                     return f"{persona}, done. {story_key} has been updated: {', '.join(f'{k}={v}' for k, v in update_fields.items())}."
                 return f"{persona}, the update failed: {result.get('error', 'unknown error')}."
             return f"{persona}, I couldn't determine which story to update or what fields to change. Could you clarify?"
+
+        # Handle implement_code intent
+        if intent.get("intent") == "implement_code":
+            entities = intent.get("entities", {})
+            story_key = entities.get("story_key")
+            story_result = await self.jira_agent.retrieve_context(f"story detail {story_key}", project_id=self._current_project_id) if story_key else {}
+            code_context = json.dumps([story_result], default=str)
+            # Try to extract story title
+            story_title = ""
+            if story_result:
+                story_data = story_result.get("data", {})
+                if isinstance(story_data, dict):
+                    story_title = story_data.get("title", "") or story_data.get("summary", "")
+                    if not story_title and story_data.get("items"):
+                        items = story_data["items"]
+                        if items and isinstance(items[0], dict):
+                            story_title = items[0].get("title", "") or items[0].get("summary", "")
+
+            if settings.ONE_MIN_AI_API_KEY:
+                try:
+                    response = await one_min_ai_completion(
+                        model=settings.LITELLM_MODEL,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are MAHALO's code generation assistant. The user wants you to write "
+                                    "implementation code for a JIRA story/task.\n\n"
+                                    f"{self._role_system_instructions(persona)}\n\n"
+                                    "INSTRUCTIONS:\n"
+                                    "1. Read the story/task details from the context below.\n"
+                                    "2. Write clean, working code that implements the described feature or fix.\n"
+                                    "3. Use the programming language specified by the user (default: Python).\n"
+                                    "4. Include clear comments explaining your implementation approach.\n"
+                                    "5. Structure the code properly (imports, classes/functions, main logic).\n"
+                                    "6. If the story lacks enough detail, state your assumptions and proceed.\n"
+                                    "7. Do NOT save or create files — just present the code for the user to review.\n"
+                                    "8. If generating multiple files, use a header like '**`filename.py`**:' before each code block."
+                                )
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Request: {query}\n"
+                                    f"Target story: {story_key or 'Not specified'}\n\n"
+                                    f"=== STORY/TASK CONTEXT ===\n{code_context}"
+                                )
+                            },
+                        ],
+                        temperature=0.3,
+                        max_tokens=2000,
+                    )
+                    generated_code = response.choices[0].message.content
+                    # Store for save_code follow-up
+                    self.last_generated_code = generated_code
+                    self.last_code_story_key = story_key
+                    self.last_code_story_title = story_title
+                    self.last_code_query = query
+                    save_hint = f"\n\n---\n*Code ready for review. Say **\"save the code\"** when you'd like me to save it to your project.*"
+                    return generated_code + save_hint
+                except Exception:
+                    pass
+            return f"{persona}, I found the story details for {story_key} but couldn't generate code right now. Please try again."
 
         # Follow-up on pending stories
         follow_up = (
@@ -1823,6 +1940,10 @@ class OrchestratorAgent:
             return f"Hello, {user_persona}. I’m MAHALO, your SDLC assistant. Ask me about delivery, incidents, deployments, logs, or production planning."
 
         # ===== LAYER 5: INTERPRETATION BEFORE ACTION =====
+        # Handle save_code directly — no need for interpretation layer
+        if self.last_intent.get("intent") == "save_code":
+            return await self._handle_save_code(user_persona)
+
         # Present understanding and ask for confirmation (unless exempt)
         if not self._should_skip_confirmation(self.last_intent, user_query, conversation_history):
             self.pending_action = {
@@ -1912,6 +2033,71 @@ class OrchestratorAgent:
         # Generate enriched context with correlation insights
         context_text = json.dumps(contexts, default=str)
         insights_text = self.correlation_engine.format_insights_for_llm()
+
+        # Handle implement_code intent — fetch story details and generate code
+        if self.last_intent.get("intent") == "implement_code":
+            story_key = self.last_intent.get("entities", {}).get("story_key")
+            code_context = context_text
+            story_title = ""
+            if story_key:
+                # Ensure we have story details in context
+                story_result = await self.jira_agent.retrieve_context(f"story detail {story_key}", project_id=self._current_project_id)
+                code_context = json.dumps([story_result] + contexts, default=str)
+                # Try to extract story title from context
+                story_data = story_result.get("data", {})
+                if isinstance(story_data, dict):
+                    story_title = story_data.get("title", "") or story_data.get("summary", "")
+                    if not story_title and story_data.get("items"):
+                        items = story_data["items"]
+                        if items and isinstance(items[0], dict):
+                            story_title = items[0].get("title", "") or items[0].get("summary", "")
+
+            if settings.ONE_MIN_AI_API_KEY:
+                try:
+                    response = await one_min_ai_completion(
+                        model=settings.LITELLM_MODEL,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are MAHALO's code generation assistant. The user wants you to write "
+                                    "implementation code for a JIRA story/task.\n\n"
+                                    f"{self._role_system_instructions(user_persona)}\n\n"
+                                    "INSTRUCTIONS:\n"
+                                    "1. Read the story/task details from the context below.\n"
+                                    "2. Write clean, working code that implements the described feature or fix.\n"
+                                    "3. Use the programming language specified by the user (default: Python).\n"
+                                    "4. Include clear comments explaining your implementation approach.\n"
+                                    "5. Structure the code properly (imports, classes/functions, main logic).\n"
+                                    "6. If the story lacks enough detail, state your assumptions and proceed.\n"
+                                    "7. Do NOT save or create files — just present the code for the user to review.\n"
+                                    "8. If generating multiple files, use a header like '**`filename.py`**:' before each code block."
+                                )
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Request: {user_query}\n"
+                                    f"Target story: {story_key or 'Not specified'}\n\n"
+                                    f"=== STORY/TASK CONTEXT ===\n{code_context}"
+                                )
+                            },
+                        ],
+                        temperature=0.3,
+                        max_tokens=2000,
+                    )
+                    generated_code = response.choices[0].message.content
+                    # Store for save_code follow-up
+                    self.last_generated_code = generated_code
+                    self.last_code_story_key = story_key
+                    self.last_code_story_title = story_title
+                    self.last_code_query = user_query
+                    # Append a hint about saving
+                    save_hint = f"\n\n---\n*Code ready for review. Say **\"save the code\"** when you'd like me to save it to your project.*"
+                    return generated_code + save_hint
+                except Exception:
+                    pass
+            return f"{user_persona}, I found the story details for {story_key} but couldn't generate code right now. Please try again."
         
         if settings.ONE_MIN_AI_API_KEY:
             try:

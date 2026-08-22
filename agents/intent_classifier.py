@@ -17,7 +17,8 @@ INTENT_SCHEMA = {
     "intent": (
         "One of: greeting, executive_overview, analyze_errors, suggest_features, suggest_work_item, "
         "count_deployments, check_velocity, story_detail, create_story, confirm_create_story, "
-        "review_pending_stories, write_test_case, incident_status, update_story, general_sdlc"
+        "review_pending_stories, write_test_case, incident_status, update_story, implement_code, "
+        "save_code, general_sdlc"
     ),
     "agents": ["JIRA Agent", "ServiceNow Agent", "Splunk Agent"],
     "entities": {"story_key": "optional STORY-* or PROJ-* key", "environment": "optional environment"},
@@ -56,6 +57,22 @@ FEW_SHOT_EXAMPLES = [
      "entities": {"story_key": "STORY-3", "update_fields": {"priority": "Critical"}}, "requires_confirmation": True, "confidence": 0.9},
     {"query": "update STORY-8 status to Done", "intent": "update_story", "agents": ["JIRA Agent"],
      "entities": {"story_key": "STORY-8", "update_fields": {"status": "Done"}}, "requires_confirmation": True, "confidence": 0.9},
+    {"query": "write python code to implement MPS-2", "intent": "implement_code", "agents": ["JIRA Agent"],
+     "entities": {"story_key": "MPS-2"}, "requires_confirmation": False, "confidence": 0.9},
+    {"query": "generate code for STORY-5", "intent": "implement_code", "agents": ["JIRA Agent"],
+     "entities": {"story_key": "STORY-5"}, "requires_confirmation": False, "confidence": 0.9},
+    {"query": "implement the fix for BUG-12 in python", "intent": "implement_code", "agents": ["JIRA Agent"],
+     "entities": {"story_key": "BUG-12"}, "requires_confirmation": False, "confidence": 0.9},
+    {"query": "code solution for PROJ-7", "intent": "implement_code", "agents": ["JIRA Agent"],
+     "entities": {"story_key": "PROJ-7"}, "requires_confirmation": False, "confidence": 0.9},
+    {"query": "save the code", "intent": "save_code", "agents": [],
+     "requires_confirmation": True, "confidence": 0.9},
+    {"query": "save the generated code", "intent": "save_code", "agents": [],
+     "requires_confirmation": True, "confidence": 0.9},
+    {"query": "looks good, save it", "intent": "save_code", "agents": [],
+     "requires_confirmation": True, "confidence": 0.9},
+    {"query": "store the code to file", "intent": "save_code", "agents": [],
+     "requires_confirmation": True, "confidence": 0.9},
     {"query": "which is the easy bug to fix", "intent": "suggest_work_item", "agents": ["JIRA Agent"],
      "requires_confirmation": False, "confidence": 0.85},
     {"query": "suggest a low effort story to pick up", "intent": "suggest_work_item", "agents": ["JIRA Agent"],
@@ -83,7 +100,7 @@ ALLOWED_INTENTS = {
     "analyze_errors", "suggest_features", "count_deployments", "check_velocity",
     "story_detail", "create_story", "confirm_create_story", "review_pending_stories",
     "write_test_case", "incident_status", "executive_overview", "greeting", "general_sdlc",
-    "update_story", "suggest_work_item",
+    "update_story", "suggest_work_item", "implement_code", "save_code",
 }
 
 # Below this confidence, prefer the deterministic keyword fallback over the LLM's guess.
@@ -195,6 +212,21 @@ class IntentClassifier:
             return self._result("executive_overview", ["JIRA Agent", "ServiceNow Agent", "Splunk Agent"])
         if any(term in query for term in ("write a test", "test case", "qa test", "validate")):
             return self._result("write_test_case", ["JIRA Agent"], story_key=story_key)
+        # Code generation / implementation requests referencing a story
+        if story_key and any(term in query for term in (
+            "write code", "write a code", "write python", "write a python",
+            "implement", "generate code", "code for", "code solution",
+            "fix code", "sample code", "example code", "solution code",
+            "build", "develop", "program", "script for",
+        )):
+            return self._result("implement_code", ["JIRA Agent"], story_key=story_key, confidence=0.92)
+        # Save generated code to disk
+        if any(term in query for term in (
+            "save the code", "save the generated", "save it", "save the file",
+            "store the code", "store the file", "save code", "write to file",
+            "save to file", "persist the code", "save this code",
+        )):
+            return self._result("save_code", [], requires_confirmation=True, confidence=0.9)
         if story_key:
             # Check if this is an update request with a story key
             # Use word-boundary-aware matching to avoid false positives (e.g., "assigned" != "assign")
