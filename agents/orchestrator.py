@@ -23,6 +23,10 @@ class OrchestratorAgent:
     _SKIP_CONFIRMATION_INTENTS = frozenset({
         "greeting", "review_pending_stories", "confirm_create_story",
         "implement_code", "save_code",
+        # Read-only intents — no confirmation needed for querying information
+        "executive_overview", "analyze_errors", "story_detail",
+        "incident_status", "check_velocity", "count_deployments",
+        "suggest_features", "suggest_work_item", "general_sdlc",
     })
 
     # Keywords that indicate the user is confirming a pending action
@@ -73,6 +77,27 @@ class OrchestratorAgent:
         if normalized in self._REJECTION_KEYWORDS:
             return True
         return any(normalized.startswith(kw) for kw in self._REJECTION_KEYWORDS)
+
+    def _extract_correction_from_rejection(self, query: str) -> str | None:
+        """Extract a corrected/clarified request from a rejection message.
+
+        E.g. "no. i want executive overview of the project" → "i want executive overview of the project"
+        E.g. "no, show me the production status" → "show me the production status"
+        E.g. "no" → None (pure rejection, no follow-up)
+        """
+        import re
+        # Strip leading rejection keyword and punctuation/connectors
+        cleaned = re.sub(
+            r"^(nope|nevermind|never mind|cancel|don'?t|do not|stop|no)[,.\s!?]*"
+            r"(actually|instead|i think|what i meant is|i meant|i want|i need|i would like|please|can you|could you)?[,.\s]*",
+            "",
+            query.strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        # If there's substantial content remaining, treat it as a new query
+        if cleaned and len(cleaned) >= 5:
+            return cleaned
+        return None
 
     async def _handle_save_code(self, persona: str) -> str:
         """Handle the save_code intent — write last generated code to the project's code/ folder."""
@@ -2040,9 +2065,16 @@ class OrchestratorAgent:
                 self.pending_action = None
                 return await self._execute_confirmed_action(action)
             elif self._is_user_rejecting(user_query):
-                # User rejected — clear and ask what else they need
+                # User rejected — check if they also provided a new/corrected request
                 self.pending_action = None
-                return f"{user_persona}, understood. What else can I help you with?"
+                corrected_query = self._extract_correction_from_rejection(user_query)
+                if corrected_query:
+                    # User said something like "no, I want X" — process X as a new query
+                    user_query = corrected_query
+                    user_query_lower = user_query.lower()
+                    # Fall through to Layer 4+ with the corrected query
+                else:
+                    return f"{user_persona}, understood. What else can I help you with?"
             else:
                 # User sent a new query instead of confirming — clear pending and proceed with new query
                 self.pending_action = None
