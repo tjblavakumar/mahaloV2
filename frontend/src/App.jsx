@@ -260,7 +260,7 @@ function App() {
                 }
               }}
               placeholder={`Ask as ${persona}...`}
-              rows="1"
+              rows="5"
               value={draft}
             />
             <button className="send-button" disabled={busy || !draft.trim()} type="submit">Send <span>↗</span></button>

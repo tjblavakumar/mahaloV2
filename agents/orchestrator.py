@@ -134,6 +134,7 @@ class OrchestratorAgent:
             "check_velocity": "review team velocity and sprint progress",
             "story_detail": "look up details for a specific JIRA story",
             "create_story": "create a new JIRA story",
+            "draft_user_story": "draft a user story based on your requirements",
             "write_test_case": "write a test case for a story",
             "incident_status": "check the current incident status",
             "update_story": "update an existing JIRA story",
@@ -162,6 +163,17 @@ class OrchestratorAgent:
                 f"**My interpretation:** You want to update {entities.get('story_key', 'a story')}: {fields_desc}.\n"
                 f"**I'll consult:** {agents_text}\n\n"
                 f"Shall I proceed?{confidence_note}"
+            )
+
+        # Special formatting for draft_user_story to show extracted topic
+        if intent_name == "draft_user_story" and entities.get("topic"):
+            topic = entities["topic"]
+            return (
+                f"{persona}, here's what I understand:\n\n"
+                f"**Your request:** {query}\n"
+                f"**My interpretation:** You want me to draft a user story about: *{topic}*.\n"
+                f"**I'll consult:** {agents_text}\n\n"
+                f"Shall I proceed, or do you have additional details to refine the story?{confidence_note}"
             )
 
         return (
@@ -226,6 +238,11 @@ class OrchestratorAgent:
                     return f"{persona}, done. {story_key} has been updated: {', '.join(f'{k}={v}' for k, v in update_fields.items())}."
                 return f"{persona}, the update failed: {result.get('error', 'unknown error')}."
             return f"{persona}, I couldn't determine which story to update or what fields to change. Could you clarify?"
+
+        # Handle draft_user_story intent — use LLM to generate a proper story draft
+        if intent.get("intent") == "draft_user_story":
+            topic = intent.get("entities", {}).get("topic", "")
+            return await self._execute_llm_story_draft(persona, query, topic)
 
         # Handle implement_code intent
         if intent.get("intent") == "implement_code":
@@ -1014,6 +1031,17 @@ class OrchestratorAgent:
             "help me write a story for",
             "help me create a user story for",
             "help me create a story for",
+            "help me to create a new user story to",
+            "help me to create a user story to",
+            "help me to create a new user story for",
+            "help me to create a user story for",
+            "to create a new user story to",
+            "to create a new user story for",
+            "to create a user story to",
+            "to create a user story for",
+            "create a new user story to",
+            "create a new user story for",
+            "create a user story to",
             "draft a user story for",
             "draft a story for",
             "write a user story for",
@@ -1027,11 +1055,19 @@ class OrchestratorAgent:
             "this",
         ]
         for prefix in prefixes:
-            topic = topic.replace(prefix, "").strip()
+            if topic.startswith(prefix):
+                topic = topic[len(prefix):].strip()
 
-        # 4. Strip trailing filler words (e.g., "me", "for me", "please")
-        trailing_filler = r"\s*(please|for me|for us|me|thanks|thank you|now|then|ok|okay|right away|asap)?\s*[.!?]*$"
-        topic = re.sub(trailing_filler, "", topic)
+        # 4. Strip trailing filler / conversational noise
+        trailing_patterns = [
+            r"\.\s*let me know if you have any questions?.*$",
+            r"\.\s*let me know.*$",
+            r"\.\s*do you have any questions?.*$",
+            r"\.\s*any questions?\??.*$",
+            r"\s*(please|for me|for us|me|thanks|thank you|now|then|ok|okay|right away|asap)?\s*[.!?]*$",
+        ]
+        for pattern in trailing_patterns:
+            topic = re.sub(pattern, "", topic, flags=re.IGNORECASE)
 
         # 5. Clean up remaining punctuation and whitespace
         topic = topic.strip(".:,;!?")
@@ -1045,6 +1081,74 @@ class OrchestratorAgent:
     def _extract_incident_id(query: str) -> str | None:
         match = re.search(r"\bINC\d+\b", query, re.IGNORECASE)
         return match.group(0).upper() if match else None
+
+    async def _execute_llm_story_draft(self, persona: str, query: str, topic: str) -> str:
+        """Use LLM to generate a proper user story draft based on the user's request."""
+        # Gather any relevant context from agents
+        incident_id = self._extract_incident_id(topic)
+        context_intent = {"agents": ["ServiceNow Agent", "Splunk Agent"]} if incident_id else {"agents": ["JIRA Agent"]}
+        agents_used, contexts = await self.retrieve_context(query, context_intent, project_id=self._current_project_id)
+        self.last_agents_used = agents_used
+        context_text = json.dumps(contexts, default=str) if contexts else "No additional context available."
+
+        if settings.ONE_MIN_AI_API_KEY:
+            try:
+                response = await one_min_ai_completion(
+                    model=settings.LITELLM_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are MAHALO's story drafting assistant. The user (a Product Manager) wants you "
+                                "to draft a JIRA user story based on their request.\n\n"
+                                f"{self._role_system_instructions(persona)}\n\n"
+                                "INSTRUCTIONS:\n"
+                                "1. Carefully read the user's request to understand the feature/offer they want to build.\n"
+                                "2. Draft a complete JIRA story with:\n"
+                                "   - A clear, concise title\n"
+                                "   - A description that captures the business context\n"
+                                "   - A user story in 'As a [persona], I want [goal], so that [benefit]' format\n"
+                                "   - Priority (based on business urgency)\n"
+                                "   - Story point estimate with brief justification\n"
+                                "   - Sprint suggestion\n"
+                                "   - Acceptance criteria (specific, testable conditions)\n"
+                                "3. If the user's request includes specific details (dates, pricing, limits), use them accurately.\n"
+                                "4. Ask clarifying questions at the end if the request is ambiguous on key points.\n"
+                                "5. Format the output clearly with labeled sections.\n"
+                                "6. Do NOT use generic/templated content — make every field specific to the user's request."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Request: {query}\n"
+                                f"Extracted topic: {topic}\n\n"
+                                f"=== AVAILABLE PROJECT CONTEXT ===\n{context_text}"
+                            )
+                        },
+                    ],
+                    temperature=0.4,
+                    max_tokens=800,
+                )
+                llm_story_text = response.choices[0].message.content
+                # Store a structured version for potential JIRA creation later
+                self.pending_stories = [{
+                    "title": topic[:80],
+                    "description": llm_story_text,
+                    "story_points": 5,
+                    "priority": "Medium",
+                    "status": "Backlog",
+                    "sprint": "Sprint 24",
+                    "acceptance_criteria": [],
+                    "evidence": [],
+                    "_llm_generated": True,
+                }]
+                return llm_story_text
+            except Exception:
+                pass
+
+        # Fallback: use the existing template-based approach if LLM is unavailable
+        return self._draft_story_for_topic(persona, topic, contexts)
 
     def _draft_story_for_topic(self, persona: str, topic: str, contexts: list[dict[str, Any]]) -> str:
         """Draft a user story for a specific topic using relevant context."""
@@ -1881,13 +1985,27 @@ class OrchestratorAgent:
             return self._elaborate_last_response(user_persona, conversation_history)
         
         # Bug #3: Story drafting assistance
+        # Instead of immediately generating a hardcoded story, route through the
+        # interpretation layer so the system shows understanding and asks confirmation.
         if self._is_story_drafting_request(user_query):
             topic = self._extract_story_topic(user_query)
             if topic:
-                incident_id = self._extract_incident_id(topic)
-                intent = {"agents": ["ServiceNow Agent", "Splunk Agent"]} if incident_id else None
-                agents_used, contexts = await self.retrieve_context(user_query, intent, project_id=self._current_project_id)
-                return self._draft_story_for_topic(user_persona, topic, contexts)
+                # Build a synthetic intent for story drafting so it flows through Layer 5
+                story_draft_intent = {
+                    "intent": "draft_user_story",
+                    "agents": ["JIRA Agent"],
+                    "entities": {"topic": topic},
+                    "requires_confirmation": True,
+                    "confidence": 0.9,
+                }
+                self.last_intent = story_draft_intent
+                self.pending_action = {
+                    "intent": story_draft_intent,
+                    "query": user_query,
+                    "persona": user_persona,
+                    "conversation_history": conversation_history,
+                }
+                return self._build_interpretation_message(user_persona, story_draft_intent, user_query)
             else:
                 return f"{user_persona}, I'd be happy to help you write a user story. What feature or issue should the story address?"
         

@@ -59,7 +59,7 @@ button { cursor: pointer; }
 .typing span:nth-child(2) { animation-delay: .2s; }.typing span:nth-child(3) { animation-delay: .4s; }
 .composer-wrap { margin-top: auto; }
 .composer { display: flex; gap: 12px; padding: 12px; border: 1px solid rgba(26, 43, 94, .2); background: var(--panel); box-shadow: 0 4px 20px rgba(26, 43, 94, .06); border-radius: 8px; }
-.composer textarea { flex: 1; min-height: 42px; max-height: 120px; resize: vertical; padding: 11px 5px; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 15px; }
+.composer textarea { flex: 1; min-height: 110px; max-height: 200px; resize: vertical; padding: 11px 5px; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 15px; }
 .composer textarea::placeholder { color: #8494b0; }
 .send-button { align-self: flex-end; padding: 11px 17px; border: 0; color: #ffffff; background: var(--accent); font-weight: 700; border-radius: 6px; }
 .send-button:hover { background: var(--accent-light); }.send-button:disabled { cursor: wait; opacity: .4; }
